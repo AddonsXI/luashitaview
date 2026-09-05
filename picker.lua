@@ -640,6 +640,11 @@ local function DrawRow(row, showOwned, needle, noInSlot)
     if (row.count ~= nil) and (row.count > 1) then
         label = label .. ' x' .. row.count;
     end
+    -- Never seen in a bag, only decoded off a Storage Slip's Extra bytes; said plainly
+    -- so it doesn't read as loose gear sitting in a container.
+    if row.onSlip then
+        label = label .. ' (on slip)';
+    end
     local flags = 0;
     local clicked;
     --[[

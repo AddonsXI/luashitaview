@@ -30,6 +30,7 @@ local ffi = require('ffi');
 local d3d8 = require('d3d8');
 local C = ffi.C;
 local prof = require('profile');
+local slipData = require('slipdata');
 
 local M = {};
 
@@ -765,7 +766,7 @@ M.LevelBadge = function(info)
     return nil;
 end
 
-M.PickerRow = function(id, info, count)
+M.PickerRow = function(id, info, count, onSlip)
     return {
         id = id,
         name = info.name,
@@ -775,6 +776,10 @@ M.PickerRow = function(id, info, count)
         ilvl = info.ilvl or 0,
         jobs = info.jobs,
         search = info.searchText,
+        -- True when this row was never actually seen in a bag, only decoded off a
+        -- Storage Slip's Extra bytes. Lets the picker say so instead of implying the
+        -- piece sits loose in a container it was never scanned out of.
+        onSlip = onSlip or nil,
     };
 end
 
@@ -829,9 +834,45 @@ M.GetItemInfo = function(itemId)
     return info;
 end
 
+--[[
+* A Storage Slip is an ordinary item sitting in a bag slot; what it holds is never
+* sent to the client as its own container, only baked into the slip's 28 byte Extra
+* field as a bitmask over a fixed, slip-specific item list. Bit N set means the
+* (N+1)th item in slipdata's list for that slip has at least one stored on it - real
+* quantity belongs to the Porter Moogle alone and never reaches the client, which is
+* why every slip find below is recorded as count 1 rather than guessed at.
+*
+* The bit order and per-slip item lists come from Windower's public resources repo
+* (resources_data/slips.lua); nothing in Ashita or the client names this mapping.
+--]]
+M.DecodeSlipContents = function(entry)
+    if (entry == nil) or (entry.Id == nil) then
+        return nil;
+    end
+    local candidates = slipData[entry.Id];
+    if (candidates == nil) then
+        return nil;
+    end
+    local extra = entry.Extra;
+    if (type(extra) ~= 'string') or (#extra == 0) then
+        return nil;
+    end
+    local out = {};
+    for i, itemId in ipairs(candidates) do
+        -- A 0 is a gap in the bit list (a retired or region-locked slot), not an item.
+        if (itemId ~= 0) then
+            local bitPos = i - 1;
+            local byteVal = string.byte(extra, bit.rshift(bitPos, 3) + 1);
+            if (byteVal ~= nil) and (bit.band(bit.rshift(byteVal, bit.band(bitPos, 7)), 1) == 1) then
+                table.insert(out, itemId);
+            end
+        end
+    end
+    return out;
+end
+
 M.ScanInventory = function(containers)
     local inv = AshitaCore:GetMemoryManager():GetInventory();
-    local out = {};
     local seen = {};
     for _, container in ipairs(containers or { 0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 }) do
         local maxSlots = inv:GetContainerCountMax(container);
@@ -841,17 +882,38 @@ M.ScanInventory = function(containers)
                 if (entry ~= nil) and (entry.Id ~= nil) and (entry.Id > 0) and (entry.Id ~= 65535) then
                     local info = M.GetItemInfo(entry.Id);
                     if (info ~= nil) and (info.slots ~= nil) and (info.slots ~= 0) then
-                        if seen[entry.Id] then
-                            seen[entry.Id].count = seen[entry.Id].count + (entry.Count or 1);
+                        local existing = seen[entry.Id];
+                        if (existing ~= nil) and (not existing.onSlip) then
+                            existing.count = existing.count + (entry.Count or 1);
                         else
-                            local row = M.PickerRow(entry.Id, info, entry.Count or 1);
-                            seen[entry.Id] = row;
-                            table.insert(out, row);
+                            -- A real bag find always replaces a slip-only placeholder rather
+                            -- than adding to it, since the placeholder's count of 1 was a
+                            -- guess, not something actually sitting in this slot.
+                            seen[entry.Id] = M.PickerRow(entry.Id, info, entry.Count or 1);
+                        end
+                    end
+
+                    -- A slip only adds a placeholder for an item nothing else has found
+                    -- yet, whether that is a bag copy scanned earlier or later, or another
+                    -- slip carrying the same item.
+                    local slipItemIds = M.DecodeSlipContents(entry);
+                    if (slipItemIds ~= nil) then
+                        for _, slipItemId in ipairs(slipItemIds) do
+                            if (seen[slipItemId] == nil) then
+                                local slipInfo = M.GetItemInfo(slipItemId);
+                                if (slipInfo ~= nil) and (slipInfo.slots ~= nil) and (slipInfo.slots ~= 0) then
+                                    seen[slipItemId] = M.PickerRow(slipItemId, slipInfo, 1, true);
+                                end
+                            end
                         end
                     end
                 end
             end
         end
+    end
+    local out = {};
+    for _, row in pairs(seen) do
+        table.insert(out, row);
     end
     table.sort(out, function(a, b) return string.lower(a.name) < string.lower(b.name); end);
     return out;
